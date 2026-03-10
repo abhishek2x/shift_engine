@@ -1,66 +1,70 @@
-# ShiftEngine Technical Details
+# ShiftEngine \- Technical Mathematics & Architecture Guide
 
-This document outlines the core mathematical executions of the ShiftEngine algorithm, specifically outlining how formulas translate into continuous, safe Python calculations.
-
----
-
-## 1. The Recursive Bayesian Update Flow
-*(Referenced in `src/math_utils.py` -> `compute_posterior_log_space()`)*
-
-When a new S&P 500 return arrives from the `DataStream` (e.g., $x_{t} = -0.03$ or a -3% drop), the recursive engine executes the following steps entirely in Log-Space.
-
-### Step 1: Calculate the Log-Likelihoods
-*(Referenced in `src/math_utils.py` -> `log_normal_pdf()`)*
-
-We invoke the same Probability Density Function (PDF) but ask two different questions based on configured market regimes:
-1.  **Call 1 (Bull Market):** "What are the odds of seeing a -3% drop if the average return is purely positive ($+0.05\%$) and volatility is low ($1.0\%$)?"
-    *   `log_likelihood_bull = log_normal_pdf(-0.03, 0.0005, 0.01)` $\approx -3.50$
-2.  **Call 2 (Bear Market):** "What are the odds of seeing a -3% drop if the average return is negative ($-0.10\%$) and volatility is wild ($2.5\%$)?"
-    *   `log_likelihood_bear = log_normal_pdf(-0.03, -0.0010, 0.025)` $\approx -1.20$
-
-### Step 2: Apply Priors (The Numerator)
-In Bayes' Theorem, the Numerator is: $\text{Likelihood} \times \text{Prior}$.
-Since logarithms transform multiplication into addition ($\ln(A \times B) = \ln(A) + \ln(B)$), we safely bypass CPU decimal precision limits:
-*   `unnorm_bull` = `log_likelihood_bull` $+$ `prior_bull`
-*   `unnorm_bear` = `log_likelihood_bear` $+$ `prior_bear`
-
-### Step 3: Calculate the Marginal Likelihood (The Denominator)
-*(Referenced in `src/math_utils.py` -> `log_sum_exp()`)*
-
-Bayes' Theorem requires dividing by the **Marginal Likelihood** (the absolute probability of seeing that exact -3% return regardless of the market state). This requires adding the probabilities of the separate states together:
-$P(\text{Data}) = P(\text{Data}|\text{Bull}) + P(\text{Data}|\text{Bear})$
-
-Because our numbers are locked in logs, we cannot add them ($ \ln(A) + \ln(B) \neq \ln(A+B) $). To do this without crashing the program via Floating Point Underflow, we utilize the **Log-Sum-Exp (LSE) Trick** (Explained in detail below). We pass the `[unnorm_bull, unnorm_bear]` variables array into this function.
-
-*   `marginal_log_prob = log_sum_exp([unnorm_bull, unnorm_bear])`
-
-### Step 4: Normalize (The Posterior)
-We finalize Bayes' Theorem by dividing our Numerator by the Denominator. In log-space, division becomes **subtraction**:
-*   `posterior_bull` = `unnorm_bull` $-$ `marginal_log_prob`
-*   `posterior_bear` = `unnorm_bear` $-$ `marginal_log_prob`
-
-These updated probabilities instantly become the Priors for the next incoming data tick, closing the $O(1)$ memory loop!
+This document breaks down the mathematical foundation of ShiftEngine, explicitly mapping the theoretical concepts to the actual variables and functions inside the Python codebase.
 
 ---
 
-## 2. In-Depth: The Log-Sum-Exp Trick
-If we try to add two extremely small floating-point decimals, the CPU rounds them to exactly `0.0`. Taking $\ln(0.0)$ crashes the engine due to a Math Domain Error. The **Log-Sum-Exp (LSE) Trick** is an algebraic workaround to add the underlying log numbers without exponentiating them back into extreme decimals.
+## 1. The Core Equation: Bayes' Theorem
+At its heart, ShiftEngine executes recursive Bayes' Theorem.
+$$ P(State_{t} | Return_{t}) = \frac{P(Return_{t} | State_{t}) \cdot P(State_{t-1})}{P(Return_{t})} $$
 
-**The Base Problem:**
-Calculate $\ln(e^A + e^B)$ without underflowing. Let $A = -100$ and $B = -105$. Python cannot directly calculate $e^{-100}$.
+### Definitions
+1.  **Prior Probability** $P(State_{t-1})$: Your belief *before* seeing the new market data.
+2.  **Likelihood** $P(Return_{t} | State_{t})$: The probability of standard normal distributions generating the specific market data we just saw.
+3.  **Marginal Likelihood (Evidence)** $P(Return_{t})$: **This is the denominator!** This is the total, absolute probability of seeing that exact market return, regardless of what state the market is in. It requires us to *add* the probability of observing the data in a Bull market to the probability of observing it in a Bear market.
+4.  **Posterior** $P(State_{t} | Return_t)$: Your computed, updated belief. This will be recursively passed down as tomorrow's Prior.
 
-**The Algebraic Solution:**
-1.  Find the absolute maximum value: Let $c = \max(A, B)$. Here, $c = -100$.
-2.  Factor $e^c$ cleanly out of the equation using exponent rules ($ e^A + e^B = e^c \cdot ( e^{A-c} + e^{B-c} ) $).
-3.  Inject this back into the logarithm:
-    $$ \ln \left[ e^c \cdot ( e^{A-c} + e^{B-c} ) \right] $$
-4.  By log multiplication rules ($\ln(X \cdot Y) = \ln(X) + \ln(Y)$), split the logarithm:
-    $$ \ln(e^c) + \ln( e^{A-c} + e^{B-c} ) $$
-5.  Since $\ln$ and $e$ instantly cancel each other out on the left variable, we arrive at the perfect computation trick:
-    $$ c + \ln( e^{A-c} + e^{B-c} ) $$
+---
 
-Because we subtracted $c$ from the exponents inside the parenthesis *before* taking the $e$, the integers inside the natural log are small, positive, and completely safe for python to handle (e.g., $\ln(e^0 + e^{-5})$).
+## 2. The Computational Danger: Floating Point Underflow
+In recursive Bayesian updates, you continuously multiply extremely small probability decimals (e.g., $0.05 \times 0.01 \times 0.20 \dots$). 
 
-**Additional Reading:**
+Very quickly, these chained multiplications result in a number smaller than a CPU's floating-point precision limit (typically $10^{-320}$). When this ceiling is breached, the program undergoes **Underflow** and rounds the probability to exactly `0.0`. Once a probability hits zero, it can never multiply back up. 
+
+---
+
+## 3. The Implementation Flow (`src/math_utils.py`)
+To prevent Underflow, we operate entirely in **Log-Space**, transforming multiplication into simple addition: $\ln(A \times B) = \ln(A) + \ln(B)$.
+
+When a new S&P 500 return arrives from your `DataStream` class, the core logic invokes `compute_posterior_log_space()`:
+
+### Step 1: Calculate the Likelihoods
+We call `log_normal_pdf(x, mean, std_dev)` twice. We pass $x$ (the market return) against two completely different configurations.
+*   **Bull Check:** We ask, "What are the odds of seeing this return if the market is trending up with low volatility?" (Outputs `log_likelihood_bull`)
+*   **Bear Check:** We ask, "What are the odds of seeing this return if the market is trending down with massive volatility?" (Outputs `log_likelihood_bear`)
+
+### Step 2: Combine Prior & Likelihood (The Numerators)
+Because we are in log-space, we simply **add** our Prior log-beliefs to our new Likelihoods.
+*   `unnorm_bull` = `log_likelihood_bull` + `prior_log_bull`
+*   `unnorm_bear` = `log_likelihood_bear` + `prior_log_bear`
+
+### Step 3: Calculate Marginal Likelihood (The Denominator & The Log-Sum-Exp Trick)
+We must complete Bayes' Theorem by dividing by the Evidence/Marginal Likelihood. The Marginal Likelihood demands we **add** our newly calculated Bull and Bear probabilities together.
+
+But we are in log-space, and **you cannot add logs together** ($\ln(A) + \ln(B) \neq \ln(A + B)$). Mathematically, we have to un-log them by exponentiating them back to decimals ($e^A + e^B$) before adding them.
+
+**The Crash:** Executing $e^A$ instantly triggers an Underflow Crash.
+**The Solution:** We pass the array `[unnorm_bull, unnorm_bear]` into the `log_sum_exp()` function.
+
+**Algebraic Derivation of LSE Trick:**
+Let $c$ be the largest log-number (e.g., $c = \max(A, B)$).
+1.  Start with: $\ln(e^A + e^B)$
+2.  Factor out $e^c$: $\ln \left[ e^c \cdot (e^{A-c} + e^{B-c}) \right]$
+3.  Split the log multiplication: $\ln(e^c) + \ln(e^{A-c} + e^{B-c})$
+4.  Cancel the $\ln(e)$ on the left: $c + \ln(e^{A-c} + e^{B-c})$
+
+*Because we subtracted $c$ from the exponents before executing $e$, the exponents are small ($0$ and a very tiny negative number). Underflow is perfectly avoided, and computations are flawless.*
+
+*   The output of `log_sum_exp()` becomes our denominator, `marginal_log_prob`.
+
+### Step 4: Normalize to Posteriors
+Finally, we calculate the continuous Bayes Posterior. Since we are in log-space, division becomes **subtraction**.
+*   `posterior_bull` = `unnorm_bull` - `marginal_log_prob`
+*   `posterior_bear` = `unnorm_bear` - `marginal_log_prob`
+
+These two values are recursively stored to be used as `prior_log_probs` during the next clock tick!
+
+---
+*For further reading on the mathematics of the LSE trick, refer to:*
 *   [Wikipedia: LogSumExp](https://en.wikipedia.org/wiki/LogSumExp)
-*   [Machine Learning Mathematical Proof: The Log-Sum-Exp Trick](https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/)
+*   [Gregory Gundersen's ML Breakdown of the Log-Sum-Exp Trick](https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/)
