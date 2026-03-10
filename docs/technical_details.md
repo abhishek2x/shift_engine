@@ -219,6 +219,185 @@ Let $c = \max(A, B)$.
 
 ---
 
+---
+
+## 7. The Data Layer: `DataStream` Class
+
+> **File:** `src/data_stream.py`
+> **Concept:** Simulates a live, event-driven market data feed with $O(1)$ memory emission.
+
+Instead of loading an entire CSV into memory at once ($O(N)$), `DataStream` emits returns **one tick at a time**, enforcing the streaming constraint required by the recursive engine.
+
+### Method Reference
+
+| Method / Property | Purpose |
+|---|---|
+| `__init__(data)` | Accepts a `List[float]` of historical returns. Raises `ValueError` if empty. |
+| `next_tick()` → `Optional[float]` | Returns the next return value, or `None` if stream is exhausted. |
+| `stream()` → `Iterator[float]` | Python generator for use in `for tick in stream.stream():` loops. |
+| `reset()` | Rewinds the internal pointer to tick 0. Useful for re-running backtests. |
+| `has_next` (property) | `True` if there are remaining ticks. |
+| `progress` (property) | Human-readable string like `"42/500 ticks"`. |
+
+### Usage Pattern
+```python
+from src.data_stream import DataStream
+
+stream = DataStream([0.01, -0.03, 0.005, -0.02])
+for tick in stream.stream():
+    # Feed tick into RegimeDetector.update()
+    pass
+```
+
+---
+
+## 8. The Brain: `RegimeDetector` Class
+
+> **File:** `src/regime_detector.py`
+> **Concept:** The main orchestrator class. Wraps all log-space math into a clean interface. Accepts raw market returns and returns human-readable probabilities.
+
+### How It Works Internally
+
+When you call `detector.update(market_return)`, the following happens inside:
+
+```
+detector.update(-0.03)
+        │
+        ▼
+┌──────────────────────────────────────────────────┐
+│  RegimeDetector.update()                         │
+│  File: src/regime_detector.py                    │
+│                                                  │
+│  Step 1: Likelihoods                             │
+│  ├─ log_normal_pdf(x, bull_mean, bull_std)       │
+│  └─ log_normal_pdf(x, bear_mean, bear_std)       │
+│       ↓ (calls src/math_utils.py, line 20)       │
+│                                                  │
+│  Step 2: Prepare Priors                          │
+│  ├─ IF transition_matrix is set (HMM ON):        │
+│  │   Apply HMM Prediction Step via log_sum_exp() │
+│  │   (see Section 9 below)                       │
+│  └─ ELSE: Use raw priors directly (pure Bayes)   │
+│                                                  │
+│  Step 3: Posterior                                │
+│  └─ compute_posterior_log_space(prior, likelih.)  │
+│       ↓ (calls src/math_utils.py, line 30)       │
+│                                                  │
+│  Step 4: Update State                            │
+│  ├─ Store new posteriors as next tick's priors    │
+│  ├─ Convert log → decimal via math.exp()         │
+│  └─ Append to self._history                      │
+│                                                  │
+│  Return (bull_prob, bear_prob)  ← floats 0 to 1  │
+└──────────────────────────────────────────────────┘
+```
+
+### Constructor Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bull_mean` | `float` | Mean return ($\mu$) of the Bull regime (e.g., `0.0005`) |
+| `bull_std` | `float` | Std dev ($\sigma$) of the Bull regime (e.g., `0.01`) |
+| `bear_mean` | `float` | Mean return ($\mu$) of the Bear regime (e.g., `-0.001`) |
+| `bear_std` | `float` | Std dev ($\sigma$) of the Bear regime (e.g., `0.025`) |
+| `initial_bull_prob` | `float` | Starting belief for Bull (default `0.5` = neutral) |
+| `transition_matrix` | `Optional[List[List[float]]]` | 2×2 HMM matrix. `None` = pure Bayes, no dampening. |
+
+### Method Reference
+
+| Method / Property | Purpose |
+|---|---|
+| `update(market_return)` → `(float, float)` | Processes one tick. Returns `(bull_prob, bear_prob)` as decimals 0–1. |
+| `reset()` | Resets beliefs and history for a fresh backtest run. |
+| `current_belief` (property) | Returns current `(bull_prob, bear_prob)` without processing a tick. |
+| `history` (property) | Full list of `(bull_prob, bear_prob)` for every processed tick. |
+| `tick_count` (property) | Number of ticks processed so far. |
+
+### Usage Pattern (Pure Bayes — No Transition Matrix)
+```python
+from src.data_stream import DataStream
+from src.regime_detector import RegimeDetector
+
+detector = RegimeDetector(
+    bull_mean=0.0005, bull_std=0.01,
+    bear_mean=-0.001, bear_std=0.025,
+)
+stream = DataStream([0.01, -0.03, 0.005, -0.02])
+
+for tick in stream.stream():
+    bull, bear = detector.update(tick)
+    print(f"Bull: {bull:.1%}, Bear: {bear:.1%}")
+```
+
+### Usage Pattern (With HMM Transition Matrix)
+```python
+detector = RegimeDetector(
+    bull_mean=0.0005, bull_std=0.01,
+    bear_mean=-0.001, bear_std=0.025,
+    transition_matrix=[
+        [0.95, 0.05],  # If Bull today: 95% stay Bull, 5% switch to Bear
+        [0.10, 0.90],  # If Bear today: 10% switch to Bull, 90% stay Bear
+    ],
+)
+```
+
+---
+
+## 9. The HMM Transition Matrix (Regime Stickiness)
+
+> **File:** `src/regime_detector.py`, inside `update()` method
+> **Concept:** Prevents signal flickering by modeling the fact that market regimes are "sticky" — if you're in a Bull market today, you're very likely still in one tomorrow.
+
+### The Problem It Solves
+Without a transition matrix, a single noisy tick (e.g., a flash crash that recovers instantly) would swing the engine to 90% Bear. In reality, regimes persist for weeks or months.
+
+### The Transition Matrix
+
+$$ P(S_{t} | S_{t-1}) = \begin{bmatrix} P(\text{Bull→Bull}) & P(\text{Bull→Bear}) \\ P(\text{Bear→Bull}) & P(\text{Bear→Bear}) \end{bmatrix} = \begin{bmatrix} 0.95 & 0.05 \\ 0.10 & 0.90 \end{bmatrix} $$
+
+### The HMM Prediction Step (inserted before Bayes update)
+Before applying the Likelihood, we first adjust our Prior using the transition probabilities. This is the **Forward Algorithm** from Hidden Markov Models:
+
+$$ P(S_t = \text{Bull}) = P(\text{Bull}|\text{Bull}) \cdot P(\text{Bull}_{t-1}) + P(\text{Bull}|\text{Bear}) \cdot P(\text{Bear}_{t-1}) $$
+$$ P(S_t = \text{Bear}) = P(\text{Bear}|\text{Bull}) \cdot P(\text{Bull}_{t-1}) + P(\text{Bear}|\text{Bear}) \cdot P(\text{Bear}_{t-1}) $$
+
+In log-space, these multiplications become additions, and the overall sums are computed via `log_sum_exp()`:
+
+```python
+# Inside RegimeDetector.update(), when transition_matrix is set:
+predicted_bull = log_sum_exp([
+    log(P(Bull|Bull)) + log_prior_bull,   # Bull stayed Bull
+    log(P(Bull|Bear)) + log_prior_bear,   # Bear switched to Bull
+])
+predicted_bear = log_sum_exp([
+    log(P(Bear|Bull)) + log_prior_bull,   # Bull switched to Bear
+    log(P(Bear|Bear)) + log_prior_bear,   # Bear stayed Bear
+])
+```
+
+These `predicted_bull` and `predicted_bear` values replace the raw priors before Step 3 (the Bayes posterior computation). The effect is that the engine resists sudden regime switches unless the evidence is overwhelmingly strong.
+
+---
+
+## 10. Future Scope
+
+### 10.1 Learning Parameters via the Baum-Welch Algorithm
+In the current implementation, the transition matrix values (e.g., 0.95 Bull→Bull) and the regime distribution parameters ($\mu$, $\sigma$) are **manually configured** based on domain knowledge.
+
+A natural extension is to use the **Baum-Welch Algorithm** (also known as the **Expectation-Maximization (EM) algorithm for HMMs**) to automatically learn these parameters from historical market data. Given a batch of past returns, Baum-Welch iteratively:
+
+1. **E-Step (Expectation):** Using the current parameter guesses, estimate the probability of being in each regime at every historical time step.
+2. **M-Step (Maximization):** Using those estimated regime assignments, re-calculate the optimal $\mu$, $\sigma$, and transition probabilities that best explain the observed data.
+3. **Repeat** until the parameters converge (stop changing significantly).
+
+The result: instead of manually guessing "95% Bull→Bull feels right," Baum-Welch would crunch 10 years of S&P 500 data and output the statistically optimal transition matrix and distribution parameters.
+
+**Potential implementation:** Python's `hmmlearn` library provides a ready-made Baum-Welch implementation that could be integrated into the engine's initialization phase to calibrate parameters before the live recursive updates begin.
+
+---
+
 ## References
 *   [Wikipedia: LogSumExp](https://en.wikipedia.org/wiki/LogSumExp)
 *   [Gregory Gundersen's ML Breakdown of the Log-Sum-Exp Trick](https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/)
+*   [Wikipedia: Baum-Welch Algorithm](https://en.wikipedia.org/wiki/Baum%E2%80%93Welch_algorithm)
+
