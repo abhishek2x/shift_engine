@@ -379,9 +379,34 @@ These `predicted_bull` and `predicted_bear` values replace the raw priors before
 
 ---
 
-## 10. Future Scope
+## 10. Historical Data Analysis (Phase 4)
 
-### 10.1 Learning Parameters via the Baum-Welch Algorithm
+To validate the engine against real-world volatility, ShiftEngine utilizes a data extraction layer (`src/fetch_data.py`) to pull historical SPY (S&P 500 ETF) data during critical market regimes.
+
+### Data Storage
+Fetched data is stored in the `/data/` directory (ignored by Git) in CSV format:
+*   `data/spy_2008_crash.csv`: The Global Financial Crisis (2007–2010).
+*   `data/spy_2020_crash.csv`: The COVID-19 Flash Crash (2019–2021).
+
+### Schema Definition
+
+| Column | Description | Mathematical Role |
+|---|---|---|
+| **Date** | The trading day (with timezone offset). | Indexing and visualization alignment. |
+| **Close** | Adjusted Closing Price. | Raw price level for visual context. |
+| **Log_Return** | $\ln(\text{Price}_t / \text{Price}_{t-1})$ | **The primary input.** Used as $x$ in `log_normal_pdf()`. |
+
+### Why Log Returns?
+In standard finance, simple returns ($(\frac{P_t}{P_{t-1}}) - 1$) are common. However, ShiftEngine uses **Log Returns** for three critical reasons:
+1.  **Mathematical Symmetry:** A 10% gain followed by a 10% loss does not return you to 100 in simple math. In log math, $\ln(1.1) + \ln(0.9) \approx 0$, which is more natural for statistical modeling.
+2.  **Aggregation:** Log returns are additive over time. The log return over 5 days is simply the sum of daily log returns. 
+3.  **PDF Consistency:** The Normal Distribution modeling in `src/math_utils.py` assumes the *change* in price follows a bell curve. Log returns are more likely to be normally distributed than raw price changes.
+
+---
+
+## 11. Future Scope
+
+### 11.1 Learning Parameters via the Baum-Welch Algorithm
 In the current implementation, the transition matrix values (e.g., 0.95 Bull→Bull) and the regime distribution parameters ($\mu$, $\sigma$) are **manually configured** based on domain knowledge.
 
 A natural extension is to use the **Baum-Welch Algorithm** (also known as the **Expectation-Maximization (EM) algorithm for HMMs**) to automatically learn these parameters from historical market data. Given a batch of past returns, Baum-Welch iteratively:
