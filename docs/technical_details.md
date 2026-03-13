@@ -402,9 +402,44 @@ In standard finance, simple returns ($(\frac{P_t}{P_{t-1}}) - 1$) are common. Ho
 2.  **Aggregation:** Log returns are additive over time. The log return over 5 days is simply the sum of daily log returns. 
 3.  **PDF Consistency:** The Normal Distribution modeling in `src/math_utils.py` assumes the *change* in price follows a bell curve. Log returns are more likely to be normally distributed than raw price changes.
 
+## 11. The Backtest Engine (Phase 4, Part 2)
+
+> **File:** `src/backtest.py`
+> **Concept:** Validates the Bayesian Engine by simulating trading days tick-by-tick using historical CSV data.
+
+The backtest engine loads historical Log Returns, feeds them into the `RegimeDetector` via a `DataStream`, and logs the resulting probability shifts.
+
+### Backtest Configuration
+For SPY analysis, the engine is initialized with the following parameters:
+*   **Bull State:** $\mu = 0.05\%$, $\sigma = 1.0\%$ (Calm, upward drift)
+*   **Bear State:** $\mu = -0.10\%$, $\sigma = 2.5\%$ (Volatile, downward drift)
+*   **Transition Matrix:** 98% Bull-persistence, 95% Bear-persistence (High stickiness to prevent flickering).
+
+### Detection Accuracy (Historical Benchmarks)
+During the **2020 COVID Crash**, the engine successfully detected a regime shift:
+*   **Target Date:** 2020-02-24
+*   **Observation:** The engine flipped from BULL to BEAR on the exact morning the market gapped down to start the crash, demonstrating high sensitivity to volatility spikes.
+
+## 12. Visualization (Phase 4, Part 3)
+
+> **File:** `src/visualize_results.py`
+> **Concept:** Transitions raw Bayesian data into an intuitive visual format for analysis.
+
+The visualization layer plots the asset price action overlaid with the engine's regime classification and internal probabilities.
+
+### Plot Features
+*   **Primary Axis (Left):** SPY Closing Price (Black line). Shows the raw market trend.
+*   **Secondary Axis (Right):** Bear Probability (Red dashed line). Shows the engine's internal confidence in a Bear market (0% to 100%).
+*   **Color-Coded Backgrounds:**
+    *   **Green Shading:** Engine detects a **BULL** regime (Bull Prob > 50%).
+    *   **Red Shading:** Engine detects a **BEAR** regime (Bear Prob > 50%).
+
+### Interpretation
+A "successful" visualization shows the red shading appearing *before* or *at the exact start* of a major price drop. The 2020 crash plot clearly demonstrates the engine's reaction to volatility on Feb 24th, where the background immediately flips red as the price begins its descent.
+
 ---
 
-## 11. Future Scope
+## 13. Future Scope
 
 ### 11.1 Learning Parameters via the Baum-Welch Algorithm
 In the current implementation, the transition matrix values (e.g., 0.95 Bull→Bull) and the regime distribution parameters ($\mu$, $\sigma$) are **manually configured** based on domain knowledge.
